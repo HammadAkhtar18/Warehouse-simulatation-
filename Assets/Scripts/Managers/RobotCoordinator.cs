@@ -23,15 +23,18 @@ namespace WarehouseSimulation.Managers
         [SerializeField, Min(1f)] private float navigationAreaRadius = 12f;
         [SerializeField, Min(0.2f)] private float assignmentInterval = 0.7f;
         [SerializeField, Min(0.1f)] private float yieldDuration = 1f;
+        [SerializeField, Min(0.5f)] private float nodeReassignmentDistance = 1.5f;
 
         [Header("Debug")]
         [SerializeField] private bool logRobotStates;
         [SerializeField] private bool enableRandomMovement = true;
+        [SerializeField] private bool enableRobotDebugLogging;
 
         private readonly List<RobotAgent> robots = new();
         private readonly List<Vector3> navigationNodes = new();
         private readonly Dictionary<RobotAgent, int> desiredNodeByRobot = new();
         private readonly Dictionary<int, RobotAgent> nodeOwner = new();
+        private readonly HashSet<int> occupiedNodes = new();
 
         private float assignmentTimer;
         private float monitorTimer;
@@ -48,6 +51,18 @@ namespace WarehouseSimulation.Managers
             BuildNavigationNodes();
             SpawnRobots();
             ConfigureLocalAvoidancePriorities();
+            ConfigureRobotDebugLogging();
+        }
+
+        private void OnDestroy()
+        {
+            // Explicitly clear containers on teardown so long-running play sessions can restart
+            // without retaining stale references from prior simulation runs.
+            robots.Clear();
+            navigationNodes.Clear();
+            desiredNodeByRobot.Clear();
+            nodeOwner.Clear();
+            occupiedNodes.Clear();
         }
 
         private void FixedUpdate()
@@ -156,6 +171,9 @@ namespace WarehouseSimulation.Managers
 
             desiredNodeByRobot.Clear();
             nodeOwner.Clear();
+            occupiedNodes.Clear();
+
+            CacheOccupiedNodes();
 
             foreach (RobotAgent robot in robots)
             {
@@ -164,7 +182,12 @@ namespace WarehouseSimulation.Managers
                     continue;
                 }
 
-                int nodeIndex = Random.Range(0, navigationNodes.Count);
+                int nodeIndex = PickBestNodeForRobot(robot);
+                if (nodeIndex < 0)
+                {
+                    continue;
+                }
+
                 desiredNodeByRobot[robot] = nodeIndex;
             }
 
@@ -200,7 +223,72 @@ namespace WarehouseSimulation.Managers
                     continue;
                 }
 
-                winner.AssignRoamingDestination(navigationNodes[nodeIndex], nodeIndex);
+                if (winner.AssignRoamingDestination(navigationNodes[nodeIndex], nodeIndex))
+                {
+                    occupiedNodes.Add(nodeIndex);
+                }
+            }
+        }
+
+        private void CacheOccupiedNodes()
+        {
+            foreach (RobotAgent robot in robots)
+            {
+                if (robot == null)
+                {
+                    continue;
+                }
+
+                if (robot.AssignedNodeId >= 0)
+                {
+                    occupiedNodes.Add(robot.AssignedNodeId);
+                }
+            }
+        }
+
+        private int PickBestNodeForRobot(RobotAgent robot)
+        {
+            int bestIndex = -1;
+            float bestScore = float.MaxValue;
+            Vector3 robotPosition = robot.transform.position;
+
+            // Optimization strategy:
+            // prefer nearest currently unoccupied node to minimize path length, lower
+            // pathfinding pressure, and reduce cross-traffic between 10+ robots.
+            for (int i = 0; i < navigationNodes.Count; i++)
+            {
+                if (occupiedNodes.Contains(i))
+                {
+                    continue;
+                }
+
+                Vector3 node = navigationNodes[i];
+                float sqrDistance = (node - robotPosition).sqrMagnitude;
+                if (sqrDistance < nodeReassignmentDistance * nodeReassignmentDistance)
+                {
+                    continue;
+                }
+
+                if (sqrDistance < bestScore)
+                {
+                    bestScore = sqrDistance;
+                    bestIndex = i;
+                }
+            }
+
+            return bestIndex;
+        }
+
+        private void ConfigureRobotDebugLogging()
+        {
+            foreach (RobotAgent robot in robots)
+            {
+                if (robot == null)
+                {
+                    continue;
+                }
+
+                robot.SetDebugLogging(enableRobotDebugLogging);
             }
         }
 

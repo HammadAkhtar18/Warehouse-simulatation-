@@ -66,6 +66,11 @@ namespace WarehouseSimulation.Robots
         [SerializeField, Min(0f)] private float taskCompletionReward = 1.2f;
         [SerializeField, Min(0.1f)] private float fastCompletionReferenceSeconds = 20f;
 
+        [Header("Debug / Visualization")]
+        [SerializeField] private bool debugLogging;
+        [SerializeField] private bool visualizePath;
+        [SerializeField] private Color pathVisualizationColor = Color.cyan;
+
         public RobotStatus Status { get; private set; } = RobotStatus.Idle;
         public int AssignedNodeId { get; private set; } = -1;
         public NavMeshAgent Agent => agent;
@@ -84,6 +89,7 @@ namespace WarehouseSimulation.Robots
         private Vector3 previousPosition;
 
         private readonly List<RobotAgent> nearbyRobotBuffer = new();
+        private Collider[] nearbyRobotColliders;
 
         private IWarehouseTask activeWarehouseTask;
         private Action<RobotAgent, IWarehouseTask> taskCompletedCallback;
@@ -93,6 +99,14 @@ namespace WarehouseSimulation.Robots
         {
             agent = GetComponent<NavMeshAgent>();
             cachedMainCamera = Camera.main;
+            nearbyRobotColliders = new Collider[Mathf.Max(8, maxNearbyRobotObservations * 4)];
+
+            // Keep the learning agent alive for continuous warehouse operation.
+            // This prevents automatic episode cutoffs from stopping the simulation loop.
+            if (useLearningDecisions && MaxStep != 0)
+            {
+                MaxStep = 0;
+            }
 
             ConfigureNavAgent();
             SetStatus(RobotStatus.Idle);
@@ -225,6 +239,11 @@ namespace WarehouseSimulation.Robots
             {
                 agent.avoidancePriority = Mathf.Clamp(priority, 0, 99);
             }
+        }
+
+        public void SetDebugLogging(bool enabled)
+        {
+            debugLogging = enabled;
         }
 
         public bool AssignRoamingDestination(Vector3 worldPosition, int nodeId)
@@ -522,7 +541,7 @@ namespace WarehouseSimulation.Robots
             {
                 if (IsObstacleCollision(collision.gameObject.layer))
                 {
-                    Debug.Log($"[{name}] Collided with obstacle: {collision.gameObject.name}");
+                    LogDebug($"Collided with obstacle: {collision.gameObject.name}");
                 }
 
                 return;
@@ -537,7 +556,7 @@ namespace WarehouseSimulation.Robots
             if (IsObstacleCollision(collision.gameObject.layer))
             {
                 AddReward(-obstacleCollisionPenalty);
-                Debug.Log($"[{name}] Collided with obstacle: {collision.gameObject.name}");
+                LogDebug($"Collided with obstacle: {collision.gameObject.name}");
             }
         }
 
@@ -582,10 +601,20 @@ namespace WarehouseSimulation.Robots
         private void PopulateNearbyRobots()
         {
             nearbyRobotBuffer.Clear();
-            Collider[] colliders = Physics.OverlapSphere(transform.position, nearbyRobotDetectionRadius, robotDetectionLayers, QueryTriggerInteraction.Ignore);
 
-            foreach (Collider hit in colliders)
+            // Optimization strategy:
+            // Use a reusable NonAlloc physics buffer to avoid per-frame heap allocations when
+            // collecting nearby robot observations (important for 10+ concurrent agents).
+            int hitCount = Physics.OverlapSphereNonAlloc(
+                transform.position,
+                nearbyRobotDetectionRadius,
+                nearbyRobotColliders,
+                robotDetectionLayers,
+                QueryTriggerInteraction.Ignore);
+
+            for (int i = 0; i < hitCount; i++)
             {
+                Collider hit = nearbyRobotColliders[i];
                 RobotAgent other = hit.GetComponentInParent<RobotAgent>();
                 if (other == null || other == this)
                 {
@@ -628,6 +657,16 @@ namespace WarehouseSimulation.Robots
             Status = newStatus;
         }
 
+        private void LogDebug(string message)
+        {
+            if (!debugLogging)
+            {
+                return;
+            }
+
+            Debug.Log($"[{name}] {message}");
+        }
+
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
         {
@@ -638,6 +677,19 @@ namespace WarehouseSimulation.Robots
             Gizmos.color = Color.red;
             Vector3 origin = transform.position + Vector3.up * 0.3f;
             Gizmos.DrawWireSphere(origin + transform.forward * obstacleProbeDistance, obstacleProbeRadius);
+
+            if (!visualizePath || agent == null || !agent.hasPath || agent.path == null)
+            {
+                return;
+            }
+
+            // Optional debug-only path rendering to inspect pathfinding efficiency and detours.
+            Gizmos.color = pathVisualizationColor;
+            Vector3[] corners = agent.path.corners;
+            for (int i = 0; i < corners.Length - 1; i++)
+            {
+                Gizmos.DrawLine(corners[i] + Vector3.up * 0.1f, corners[i + 1] + Vector3.up * 0.1f);
+            }
         }
 #endif
     }
