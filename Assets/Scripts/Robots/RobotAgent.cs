@@ -6,6 +6,7 @@ using Unity.MLAgents.Sensors;
 using UnityEngine;
 using UnityEngine.AI;
 using WarehouseSimulation.Tasks;
+using WarehouseSimulation.Managers;
 
 namespace WarehouseSimulation.Robots
 {
@@ -58,10 +59,6 @@ namespace WarehouseSimulation.Robots
         [SerializeField, Min(0.1f)] private float decisionTargetRadius = 6f;
         [SerializeField, Min(0.1f)] private float decisionStepDistance = 2.5f;
         [SerializeField, Min(0f)] private float timePenaltyPerStep = 0.01f;
-        [SerializeField, Min(0f)] private float movementTowardTargetRewardPerUnit = 0.1f;
-        [SerializeField, Min(0f)] private float taskCompletionReward = 10f;
-        [SerializeField, Min(0f)] private float collisionPenalty = 5f;
-        [SerializeField, Min(0f)] private float idlePenalty = 0.5f;
         [SerializeField, Min(0.1f)] private float idleTimeoutSeconds = 3f;
         [SerializeField] private LayerMask robotDetectionLayers;
         [SerializeField, Min(0.5f)] private float nearbyRobotDetectionRadius = 5f;
@@ -79,6 +76,10 @@ namespace WarehouseSimulation.Robots
         public bool IsBusy => activeWarehouseTask != null || Status == RobotStatus.Picking || Status == RobotStatus.Delivering || Status == RobotStatus.Moving;
         public float EpisodeDistanceTraveled { get; private set; }
         public int EpisodeCollisionCount { get; private set; }
+        public int CompletedTaskCount { get; private set; }
+        public float AverageTaskCompletionTime => completedTaskCounter > 0 ? cumulativeTaskDuration / completedTaskCounter : 0f;
+        public float AverageTaskEfficiency => completedTaskCounter > 0 ? cumulativeTaskEfficiency / completedTaskCounter : 1f;
+        public float RewardTrendPerSecond { get; private set; }
 
         private NavMeshAgent agent;
         private Camera cachedMainCamera;
@@ -93,6 +94,18 @@ namespace WarehouseSimulation.Robots
         private Quaternion initialRotation;
         private float previousDistanceToTarget;
         private float idleTime;
+        private float previousVelocity;
+        private float lastTrendReward;
+        private float trendTimer;
+        private float taskPathDistance;
+        private float taskDirectDistance;
+        private float runningAverageTaskTime = 10f;
+        private float cumulativeTaskDuration;
+        private float cumulativeTaskEfficiency;
+        private int completedTaskCounter;
+        private float coordinationRewardCooldown;
+
+        private readonly Dictionary<string, float> rewardBreakdown = new();
 
         private readonly List<RobotAgent> nearbyRobotBuffer = new();
         private Collider[] nearbyRobotColliders;
@@ -100,6 +113,7 @@ namespace WarehouseSimulation.Robots
         private IWarehouseTask activeWarehouseTask;
         private Action<RobotAgent, IWarehouseTask> taskCompletedCallback;
         private Transform activeDeliveryZone;
+        private RewardTuner rewardTuner;
 
         private void Awake()
         {
@@ -120,6 +134,7 @@ namespace WarehouseSimulation.Robots
             initialRotation = transform.rotation;
             previousPosition = transform.position;
             previousDistanceToTarget = 0f;
+            rewardTuner = FindObjectOfType<RewardTuner>();
         }
 
         private void Update()
@@ -151,6 +166,13 @@ namespace WarehouseSimulation.Robots
             previousPosition = transform.position;
             previousDistanceToTarget = Vector3.Distance(transform.position, GetCurrentLearningTarget());
             idleTime = 0f;
+            previousVelocity = 0f;
+            taskPathDistance = 0f;
+            taskDirectDistance = 0f;
+            rewardBreakdown.Clear();
+            lastTrendReward = 0f;
+            RewardTrendPerSecond = 0f;
+            trendTimer = 0f;
 
             if (agent != null && agent.isOnNavMesh)
             {
@@ -290,6 +312,8 @@ namespace WarehouseSimulation.Robots
 
             activeWarehouseTask = task;
             taskStartTime = Time.time;
+            taskPathDistance = 0f;
+            taskDirectDistance = Vector3.Distance(task.TargetShelf.transform.position, transform.position);
             activeDeliveryZone = deliveryZone != null ? deliveryZone : deliveryPoint;
             taskCompletedCallback = onTaskCompleted;
             pickDuration = Mathf.Max(0.1f, pickSeconds);
@@ -322,6 +346,11 @@ namespace WarehouseSimulation.Robots
             AssignedNodeId = -1;
             agent.ResetPath();
             SetStatus(RobotStatus.Yielding);
+
+            if (useLearningDecisions)
+            {
+                AddRewardByCategory("Coordination.SuccessfulYielding", GetWeights().SuccessfulYieldingReward);
+            }
         }
 
         private void HandleDestinationInput()
@@ -473,7 +502,29 @@ namespace WarehouseSimulation.Robots
 
             if (useLearningDecisions)
             {
-                AddReward(taskCompletionReward);
+                RewardWeights weights = GetWeights();
+                float taskDuration = taskStartTime > 0f ? Time.time - taskStartTime : 0f;
+                bool fasterThanAverage = taskDuration > 0f && taskDuration < runningAverageTaskTime;
+                float efficiency = taskPathDistance > 0.1f
+                    ? Mathf.Clamp01(taskDirectDistance / taskPathDistance)
+                    : 1f;
+
+                AddRewardByCategory("Task.BaseCompletion", weights.TaskCompletionBaseReward);
+                if (fasterThanAverage)
+                {
+                    AddRewardByCategory("Task.SpeedBonus", weights.TaskCompletionSpeedBonus);
+                }
+
+                if (efficiency >= 0.92f)
+                {
+                    AddRewardByCategory("Task.EfficiencyBonus", weights.TaskCompletionEfficiencyBonus);
+                }
+
+                runningAverageTaskTime = Mathf.Lerp(runningAverageTaskTime, Mathf.Max(0.01f, taskDuration), 0.15f);
+                cumulativeTaskDuration += taskDuration;
+                cumulativeTaskEfficiency += efficiency;
+                completedTaskCounter++;
+                CompletedTaskCount++;
             }
 
             taskStartTime = 0f;
@@ -548,13 +599,13 @@ namespace WarehouseSimulation.Robots
 
             if (collision.gameObject.GetComponentInParent<RobotAgent>() != null)
             {
-                AddReward(-collisionPenalty);
+                AddRewardByCategory("Penalty.RobotCollision", -GetWeights().CollisionWithRobotPenalty);
                 return;
             }
 
             if (IsObstacleCollision(collision.gameObject.layer))
             {
-                AddReward(-collisionPenalty);
+                AddRewardByCategory("Penalty.ObstacleCollision", -GetWeights().CollisionWithObstaclePenalty);
                 LogDebug($"Collided with obstacle: {collision.gameObject.name}");
             }
         }
@@ -567,6 +618,7 @@ namespace WarehouseSimulation.Robots
             if (delta > 0.0001f)
             {
                 EpisodeDistanceTraveled += delta;
+                taskPathDistance += delta;
             }
 
             previousPosition = currentPosition;
@@ -656,21 +708,58 @@ namespace WarehouseSimulation.Robots
 
         private void ApplyLearningRewards(Vector2 moveDirection)
         {
+            RewardWeights weights = GetWeights();
             float currentDistance = Vector3.Distance(transform.position, GetCurrentLearningTarget());
             float towardTargetDelta = previousDistanceToTarget - currentDistance;
             if (towardTargetDelta > 0f)
             {
-                AddReward(towardTargetDelta * movementTowardTargetRewardPerUnit);
+                AddRewardByCategory("Movement.ProgressTowardTarget", towardTargetDelta * weights.ProgressTowardTargetRewardPerUnit);
             }
 
             AddReward(-timePenaltyPerStep);
 
+            float efficiencyDelta = EpisodeDistanceTraveled > 0.01f
+                ? Mathf.Max(0f, (agent.velocity.magnitude * Time.deltaTime) - Mathf.Max(0f, towardTargetDelta))
+                : 0f;
+            if (efficiencyDelta > 0.001f)
+            {
+                AddRewardByCategory("Penalty.PathInefficiency", -weights.PathInefficiencyPenaltyPerUnit * efficiencyDelta);
+            }
+
+            if (towardTargetDelta < -0.001f && moveDirection.sqrMagnitude > 0.05f)
+            {
+                AddRewardByCategory("Penalty.WrongDirection", -weights.WrongDirectionPenalty);
+            }
+
+            Vector3 targetDirection = (GetCurrentLearningTarget() - transform.position).normalized;
+            Vector3 velocityDirection = agent.velocity.sqrMagnitude > 0.01f ? agent.velocity.normalized : Vector3.zero;
+            if (velocityDirection != Vector3.zero && Vector3.Dot(targetDirection, velocityDirection) > 0.85f)
+            {
+                AddRewardByCategory("Movement.EfficientPathfinding", weights.EfficientPathfindingRewardPerMove);
+            }
+
+            float velocityDelta = Mathf.Abs(agent.velocity.magnitude - previousVelocity);
+            if (agent.velocity.magnitude > 0.05f && velocityDelta < 0.2f)
+            {
+                AddRewardByCategory("Movement.SmoothMovement", weights.SmoothMovementReward);
+            }
+
+            PopulateNearbyRobots();
+            if (nearbyRobotBuffer.Count >= 2 && towardTargetDelta > 0.01f && coordinationRewardCooldown <= 0f)
+            {
+                AddRewardByCategory("Coordination.AvoidCongestion", weights.AvoidingCongestionReward);
+                AddRewardByCategory("Coordination.CooperativePathfinding", weights.CooperativePathfindingReward);
+                coordinationRewardCooldown = 0.5f;
+            }
+
+            coordinationRewardCooldown = Mathf.Max(0f, coordinationRewardCooldown - Time.deltaTime);
+
             if (moveDirection.sqrMagnitude < 0.01f || agent.velocity.magnitude < idleSpeedThreshold)
             {
                 idleTime += Time.deltaTime;
-                if (idleTime >= idleTimeoutSeconds)
+                if (idleTime >= Mathf.Max(idleTimeoutSeconds, 5f))
                 {
-                    AddReward(-idlePenalty);
+                    AddRewardByCategory("Penalty.ExcessiveIdle", -weights.ExcessiveIdlePenalty);
                     idleTime = 0f;
                 }
             }
@@ -680,6 +769,44 @@ namespace WarehouseSimulation.Robots
             }
 
             previousDistanceToTarget = currentDistance;
+            previousVelocity = agent.velocity.magnitude;
+
+            trendTimer += Time.deltaTime;
+            if (trendTimer >= 1f)
+            {
+                float currentReward = GetCumulativeReward();
+                RewardTrendPerSecond = currentReward - lastTrendReward;
+                lastTrendReward = currentReward;
+                trendTimer = 0f;
+            }
+        }
+
+        public Dictionary<string, float> GetRewardBreakdownSnapshot()
+        {
+            return new Dictionary<string, float>(rewardBreakdown);
+        }
+
+        private RewardWeights GetWeights()
+        {
+            if (rewardTuner == null)
+            {
+                rewardTuner = FindObjectOfType<RewardTuner>();
+            }
+
+            return rewardTuner != null ? rewardTuner.CurrentWeights : RewardWeights.CreateDefault();
+        }
+
+        private void AddRewardByCategory(string category, float amount)
+        {
+            AddReward(amount);
+            if (rewardBreakdown.TryGetValue(category, out float value))
+            {
+                rewardBreakdown[category] = value + amount;
+            }
+            else
+            {
+                rewardBreakdown[category] = amount;
+            }
         }
 
         private void ApplyLearningMovement(Vector2 moveDirection, float speedScale)
