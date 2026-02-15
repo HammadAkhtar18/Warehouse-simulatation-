@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
@@ -25,6 +26,10 @@ namespace WarehouseSimulation.Managers
         [SerializeField, Min(0.1f)] private float yieldDuration = 1f;
         [SerializeField, Min(0.5f)] private float nodeReassignmentDistance = 1.5f;
 
+        [Header("Deadlock Resolution")]
+        [SerializeField, Min(0.1f)] private float deadlockResolutionDistance = 3f;
+        [SerializeField, Min(0.05f)] private float deadlockRepathDelay = 0.5f;
+
         [Header("Debug")]
         [SerializeField] private bool logRobotStates;
         [SerializeField] private bool enableRandomMovement = true;
@@ -39,6 +44,9 @@ namespace WarehouseSimulation.Managers
         private float assignmentTimer;
         private float monitorTimer;
 
+        private DeadlockDetector deadlockDetector;
+        private PriorityManager priorityManager;
+
         public IReadOnlyList<RobotAgent> ActiveRobots => robots;
 
         public void SetRandomMovementEnabled(bool enabled)
@@ -52,6 +60,18 @@ namespace WarehouseSimulation.Managers
             SpawnRobots();
             ConfigureLocalAvoidancePriorities();
             ConfigureRobotDebugLogging();
+
+            deadlockDetector = GetComponent<DeadlockDetector>();
+            if (deadlockDetector == null)
+            {
+                deadlockDetector = gameObject.AddComponent<DeadlockDetector>();
+            }
+
+            priorityManager = GetComponent<PriorityManager>();
+            if (priorityManager == null)
+            {
+                priorityManager = gameObject.AddComponent<PriorityManager>();
+            }
         }
 
         private void OnDestroy()
@@ -75,6 +95,15 @@ namespace WarehouseSimulation.Managers
                     assignmentTimer = 0f;
                     AssignRandomMovementTasks();
                 }
+            }
+
+            List<RobotAgent> stuckRobots = deadlockDetector != null
+                ? deadlockDetector.DetectDeadlocks(robots)
+                : new List<RobotAgent>();
+
+            if (stuckRobots.Count >= 2)
+            {
+                ResolveDeadlock(stuckRobots);
             }
 
             MonitorRobotStates();
@@ -277,6 +306,66 @@ namespace WarehouseSimulation.Managers
             }
 
             return bestIndex;
+        }
+
+
+        public void ResolveDeadlock(List<RobotAgent> stuckRobots)
+        {
+            if (stuckRobots == null || stuckRobots.Count < 2 || priorityManager == null)
+            {
+                return;
+            }
+
+            RobotAgent robotToReposition = null;
+            int lowestPriority = int.MaxValue;
+
+            for (int i = 0; i < stuckRobots.Count; i++)
+            {
+                RobotAgent candidate = stuckRobots[i];
+                if (candidate == null || candidate.Agent == null || !candidate.Agent.isOnNavMesh)
+                {
+                    continue;
+                }
+
+                int priority = priorityManager.GetRobotPriority(candidate);
+                if (priority < lowestPriority)
+                {
+                    lowestPriority = priority;
+                    robotToReposition = candidate;
+                }
+            }
+
+            if (robotToReposition == null)
+            {
+                return;
+            }
+
+            NavMeshAgent navAgent = robotToReposition.Agent;
+            bool hadOriginalDestination = navAgent.hasPath;
+            Vector3 originalDestination = hadOriginalDestination ? navAgent.destination : robotToReposition.transform.position;
+            Vector3 backwardTarget = robotToReposition.transform.position - (robotToReposition.transform.forward * deadlockResolutionDistance);
+            if (!NavMesh.SamplePosition(backwardTarget, out NavMeshHit hit, deadlockResolutionDistance + 1f, NavMesh.AllAreas))
+            {
+                return;
+            }
+
+            navAgent.ResetPath();
+            navAgent.SetDestination(hit.position);
+            StartCoroutine(RecalculatePathAfterRetreat(navAgent, originalDestination, hadOriginalDestination));
+        }
+
+
+        private IEnumerator RecalculatePathAfterRetreat(NavMeshAgent navAgent, Vector3 originalDestination, bool hadOriginalDestination)
+        {
+            yield return new WaitForSeconds(deadlockRepathDelay);
+
+            if (navAgent == null || !navAgent.isOnNavMesh || !hadOriginalDestination)
+            {
+                yield break;
+            }
+
+            navAgent.ResetPath();
+            navAgent.SetDestination(originalDestination);
         }
 
         private void ConfigureRobotDebugLogging()

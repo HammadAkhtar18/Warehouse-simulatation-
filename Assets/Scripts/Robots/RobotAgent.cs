@@ -74,6 +74,7 @@ namespace WarehouseSimulation.Robots
         public int AssignedNodeId { get; private set; } = -1;
         public NavMeshAgent Agent => agent;
         public bool IsBusy => activeWarehouseTask != null || Status == RobotStatus.Picking || Status == RobotStatus.Delivering || Status == RobotStatus.Moving;
+        public IWarehouseTask ActiveWarehouseTask => activeWarehouseTask;
         public float EpisodeDistanceTraveled { get; private set; }
         public int EpisodeCollisionCount { get; private set; }
         public int CompletedTaskCount { get; private set; }
