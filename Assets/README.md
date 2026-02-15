@@ -14,3 +14,7 @@
 ## Initial Scene
 
 - `Scenes/Warehouse.unity` contains the base warehouse layout scaffold.
+
+## Phase 7 UI Dashboard
+
+Runtime UI dashboard is implemented with Unity Canvas + TextMeshPro in `Scripts/UI/WarehouseDashboardUI.cs` and connected to metric data via `Scripts/Managers/SimulationMetrics.cs`.
