@@ -42,6 +42,7 @@ namespace WarehouseSimulation.Managers
         [SerializeField] private bool verboseLogging;
 
         private readonly List<Shelf> allShelves = new();
+        private readonly List<Shelf> orderShelfCandidates = new();
         private readonly List<Order> orderQueue = new();
         private readonly List<RestockTask> restockQueue = new();
         private readonly HashSet<Shelf> restockShelvesPending = new();
@@ -57,6 +58,11 @@ namespace WarehouseSimulation.Managers
         private float orderTimer;
         private int deliveryStreak;
         private int taskSequence;
+
+        public void SetVerboseLogging(bool enabled)
+        {
+            verboseLogging = enabled;
+        }
 
         private void Awake()
         {
@@ -100,6 +106,14 @@ namespace WarehouseSimulation.Managers
                     shelf.OnLowStockDetected -= HandleLowStockDetected;
                 }
             }
+
+            // Clear retained references so scene reloads do not accumulate stale task state.
+            allShelves.Clear();
+            orderShelfCandidates.Clear();
+            orderQueue.Clear();
+            restockQueue.Clear();
+            restockShelvesPending.Clear();
+            activeAssignments.Clear();
         }
 
         private void DiscoverShelves()
@@ -167,22 +181,25 @@ namespace WarehouseSimulation.Managers
 
         private Shelf PickRandomOrderShelf()
         {
-            List<Shelf> candidates = new();
+            // Optimization strategy:
+            // Reuse a persistent candidate list to avoid per-order allocations during
+            // long-running simulations and higher order throughput.
+            orderShelfCandidates.Clear();
             foreach (Shelf shelf in allShelves)
             {
                 if (shelf != null && shelf.CurrentStock > 0 && shelf.InventoryItem != null)
                 {
-                    candidates.Add(shelf);
+                    orderShelfCandidates.Add(shelf);
                 }
             }
 
-            if (candidates.Count == 0)
+            if (orderShelfCandidates.Count == 0)
             {
                 return null;
             }
 
-            int randomIndex = UnityEngine.Random.Range(0, candidates.Count);
-            return candidates[randomIndex];
+            int randomIndex = UnityEngine.Random.Range(0, orderShelfCandidates.Count);
+            return orderShelfCandidates[randomIndex];
         }
 
         private TaskPriority EvaluateOrderPriority(Shelf shelf, int quantity)

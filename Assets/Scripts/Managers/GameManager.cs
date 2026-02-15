@@ -13,14 +13,25 @@ namespace WarehouseSimulation.Managers
         [SerializeField] private RobotCoordinator robotCoordinator;
         [SerializeField] private PerformanceMetrics performanceMetrics;
 
-        // Reserved for future initialization flow.
+        [Header("Runtime Controls")]
+        [SerializeField] private bool runIndefinitely = true;
+        [SerializeField] private bool enableDebugLogging;
+
         private void Awake()
         {
+            if (runIndefinitely)
+            {
+                // Prevent pausing when the window loses focus so the simulation can run continuously.
+                Application.runInBackground = true;
+            }
         }
 
-        // Reserved for future simulation start sequence.
         private void Start()
         {
+            if (taskManager != null)
+            {
+                taskManager.SetVerboseLogging(enableDebugLogging);
+            }
         }
     }
 }
