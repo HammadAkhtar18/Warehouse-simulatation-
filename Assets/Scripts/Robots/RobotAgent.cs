@@ -1,4 +1,8 @@
 using System;
+using System.Collections.Generic;
+using Unity.MLAgents;
+using Unity.MLAgents.Actuators;
+using Unity.MLAgents.Sensors;
 using UnityEngine;
 using UnityEngine.AI;
 using WarehouseSimulation.Tasks;
@@ -8,9 +12,10 @@ namespace WarehouseSimulation.Robots
     /// <summary>
     /// Controls a single autonomous warehouse robot using Unity's NavMesh.
     /// Handles movement constraints, pick/deliver flow, and optional manual/random roaming.
+    /// Phase 6A: also exposes ML-Agents observations/actions/rewards for learning-based decisions.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
-    public class RobotAgent : MonoBehaviour
+    public class RobotAgent : Agent
     {
         public enum RobotStatus
         {
@@ -48,6 +53,19 @@ namespace WarehouseSimulation.Robots
         [Header("Robot Avoidance")]
         [SerializeField] private ObstacleAvoidanceType obstacleAvoidanceQuality = ObstacleAvoidanceType.HighQualityObstacleAvoidance;
 
+        [Header("ML-Agents Decision Setup")]
+        [SerializeField] private bool useLearningDecisions;
+        [SerializeField, Min(0.1f)] private float decisionTargetRadius = 6f;
+        [SerializeField, Min(0.1f)] private float decisionStepDistance = 2.5f;
+        [SerializeField, Min(0f)] private float idlePenaltyPerSecond = 0.0015f;
+        [SerializeField] private LayerMask robotDetectionLayers;
+        [SerializeField, Min(0.5f)] private float nearbyRobotDetectionRadius = 5f;
+        [SerializeField, Range(1, 8)] private int maxNearbyRobotObservations = 3;
+        [SerializeField, Min(0f)] private float collisionPenalty = 0.3f;
+        [SerializeField, Min(0f)] private float obstacleCollisionPenalty = 0.15f;
+        [SerializeField, Min(0f)] private float taskCompletionReward = 1.2f;
+        [SerializeField, Min(0.1f)] private float fastCompletionReferenceSeconds = 20f;
+
         public RobotStatus Status { get; private set; } = RobotStatus.Idle;
         public int AssignedNodeId { get; private set; } = -1;
         public NavMeshAgent Agent => agent;
@@ -60,6 +78,9 @@ namespace WarehouseSimulation.Robots
         private float statusTimer;
         private bool shouldPerformPickOnArrival;
         private float yieldingTimer;
+        private float taskStartTime;
+
+        private readonly List<RobotAgent> nearbyRobotBuffer = new();
 
         private IWarehouseTask activeWarehouseTask;
         private Action<RobotAgent, IWarehouseTask> taskCompletedCallback;
@@ -81,6 +102,95 @@ namespace WarehouseSimulation.Robots
             UpdateStatusStateMachine();
             UpdateConstrainedSpeed();
             ProbeForwardForObstacle();
+
+            if (useLearningDecisions && Status == RobotStatus.Idle)
+            {
+                AddReward(-idlePenaltyPerSecond * Time.deltaTime);
+            }
+        }
+
+        public override void OnEpisodeBegin()
+        {
+            AssignedNodeId = -1;
+            shouldPerformPickOnArrival = false;
+            statusTimer = 0f;
+            yieldingTimer = 0f;
+            taskStartTime = 0f;
+            activeWarehouseTask = null;
+            activeDeliveryZone = null;
+            taskCompletedCallback = null;
+
+            if (agent != null && agent.isOnNavMesh)
+            {
+                agent.ResetPath();
+            }
+
+            SetStatus(RobotStatus.Idle);
+        }
+
+        public override void CollectObservations(VectorSensor sensor)
+        {
+            Vector3 target = GetCurrentLearningTarget();
+            Vector3 toTarget = target - transform.position;
+            float distanceToTarget = toTarget.magnitude;
+
+            sensor.AddObservation(Mathf.Clamp01(distanceToTarget / Mathf.Max(decisionTargetRadius, 0.1f)));
+
+            Vector3 localTargetDirection = transform.InverseTransformDirection(toTarget.normalized);
+            sensor.AddObservation(localTargetDirection.x);
+            sensor.AddObservation(localTargetDirection.z);
+
+            PopulateNearbyRobots();
+            for (int i = 0; i < maxNearbyRobotObservations; i++)
+            {
+                if (i >= nearbyRobotBuffer.Count)
+                {
+                    sensor.AddObservation(0f);
+                    sensor.AddObservation(0f);
+                    sensor.AddObservation(0f);
+                    continue;
+                }
+
+                Vector3 offset = nearbyRobotBuffer[i].transform.position - transform.position;
+                Vector3 localOffset = transform.InverseTransformDirection(offset.normalized);
+                sensor.AddObservation(localOffset.x);
+                sensor.AddObservation(localOffset.z);
+                sensor.AddObservation(Mathf.Clamp01(offset.magnitude / nearbyRobotDetectionRadius));
+            }
+
+            // Current task type encoded as one-hot: [Idle, Order, Restock].
+            sensor.AddObservation(activeWarehouseTask == null ? 1f : 0f);
+            sensor.AddObservation(activeWarehouseTask != null && !activeWarehouseTask.IsRestockTask ? 1f : 0f);
+            sensor.AddObservation(activeWarehouseTask != null && activeWarehouseTask.IsRestockTask ? 1f : 0f);
+        }
+
+        public override void OnActionReceived(ActionBuffers actions)
+        {
+            if (!useLearningDecisions || !agent.isOnNavMesh)
+            {
+                return;
+            }
+
+            ActionSegment<float> continuous = actions.ContinuousActions;
+            if (continuous.Length < 3)
+            {
+                return;
+            }
+
+            Vector2 moveDirection = new Vector2(
+                Mathf.Clamp(continuous[0], -1f, 1f),
+                Mathf.Clamp(continuous[1], -1f, 1f));
+            float speedScale = Mathf.Clamp01((continuous[2] + 1f) * 0.5f);
+
+            ApplyLearningMovement(moveDirection, speedScale);
+        }
+
+        public override void Heuristic(in ActionBuffers actionsOut)
+        {
+            ActionSegment<float> continuous = actionsOut.ContinuousActions;
+            continuous[0] = Input.GetAxisRaw("Horizontal");
+            continuous[1] = Input.GetAxisRaw("Vertical");
+            continuous[2] = Input.GetKey(KeyCode.LeftShift) ? 1f : 0f;
         }
 
         private void ConfigureNavAgent()
@@ -151,6 +261,7 @@ namespace WarehouseSimulation.Robots
             }
 
             activeWarehouseTask = task;
+            taskStartTime = Time.time;
             activeDeliveryZone = deliveryZone != null ? deliveryZone : deliveryPoint;
             taskCompletedCallback = onTaskCompleted;
             pickDuration = Mathf.Max(0.1f, pickSeconds);
@@ -332,6 +443,15 @@ namespace WarehouseSimulation.Robots
             IWarehouseTask completedTask = activeWarehouseTask;
             activeWarehouseTask = null;
 
+            if (useLearningDecisions)
+            {
+                float completionTime = taskStartTime > 0f ? Time.time - taskStartTime : fastCompletionReferenceSeconds;
+                float speedMultiplier = Mathf.Clamp01(fastCompletionReferenceSeconds / Mathf.Max(0.1f, completionTime));
+                AddReward(taskCompletionReward * speedMultiplier);
+            }
+
+            taskStartTime = 0f;
+
             Action<RobotAgent, IWarehouseTask> callback = taskCompletedCallback;
             taskCompletedCallback = null;
             activeDeliveryZone = null;
@@ -388,8 +508,25 @@ namespace WarehouseSimulation.Robots
 
         private void OnCollisionEnter(Collision collision)
         {
+            if (!useLearningDecisions)
+            {
+                if (IsObstacleCollision(collision.gameObject.layer))
+                {
+                    Debug.Log($"[{name}] Collided with obstacle: {collision.gameObject.name}");
+                }
+
+                return;
+            }
+
+            if (collision.gameObject.GetComponentInParent<RobotAgent>() != null)
+            {
+                AddReward(-collisionPenalty);
+                return;
+            }
+
             if (IsObstacleCollision(collision.gameObject.layer))
             {
+                AddReward(-obstacleCollisionPenalty);
                 Debug.Log($"[{name}] Collided with obstacle: {collision.gameObject.name}");
             }
         }
@@ -403,6 +540,65 @@ namespace WarehouseSimulation.Robots
         }
 
         private bool IsObstacleCollision(int otherLayer) => (obstacleLayers.value & (1 << otherLayer)) != 0;
+
+        private Vector3 GetCurrentLearningTarget()
+        {
+            if (agent != null && agent.hasPath)
+            {
+                return agent.destination;
+            }
+
+            if (activeWarehouseTask?.TargetShelf != null)
+            {
+                return activeWarehouseTask.TargetShelf.transform.position;
+            }
+
+            return transform.position + transform.forward * decisionStepDistance;
+        }
+
+        private void PopulateNearbyRobots()
+        {
+            nearbyRobotBuffer.Clear();
+            Collider[] colliders = Physics.OverlapSphere(transform.position, nearbyRobotDetectionRadius, robotDetectionLayers, QueryTriggerInteraction.Ignore);
+
+            foreach (Collider hit in colliders)
+            {
+                RobotAgent other = hit.GetComponentInParent<RobotAgent>();
+                if (other == null || other == this)
+                {
+                    continue;
+                }
+
+                nearbyRobotBuffer.Add(other);
+            }
+
+            nearbyRobotBuffer.Sort((lhs, rhs) =>
+                Vector3.SqrMagnitude(lhs.transform.position - transform.position)
+                    .CompareTo(Vector3.SqrMagnitude(rhs.transform.position - transform.position)));
+        }
+
+        private void ApplyLearningMovement(Vector2 moveDirection, float speedScale)
+        {
+            Vector3 localDirection = new Vector3(moveDirection.x, 0f, moveDirection.y);
+            if (localDirection.sqrMagnitude < 0.001f)
+            {
+                return;
+            }
+
+            Vector3 worldDirection = transform.TransformDirection(localDirection.normalized);
+            Vector3 destination = transform.position + (worldDirection * decisionStepDistance);
+
+            if (NavMesh.SamplePosition(destination, out NavMeshHit navHit, decisionStepDistance, NavMesh.AllAreas))
+            {
+                shouldPerformPickOnArrival = false;
+                AssignedNodeId = -1;
+                agent.SetDestination(navHit.position);
+                statusTimer = 0f;
+                SetStatus(RobotStatus.Moving);
+            }
+
+            agent.speed = Mathf.Max(0.1f, maxSpeed * speedScale);
+        }
 
         private void SetStatus(RobotStatus newStatus)
         {
