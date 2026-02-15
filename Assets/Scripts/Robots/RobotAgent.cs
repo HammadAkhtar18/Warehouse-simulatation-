@@ -16,7 +16,8 @@ namespace WarehouseSimulation.Robots
             Idle,
             Moving,
             Picking,
-            Delivering
+            Delivering,
+            Yielding
         }
 
         [Header("Movement Constraints")]
@@ -43,13 +44,20 @@ namespace WarehouseSimulation.Robots
         [SerializeField, Min(0.05f)] private float obstacleProbeRadius = 0.3f;
         [SerializeField, Min(0.2f)] private float obstacleProbeDistance = 0.8f;
 
+        [Header("Robot Avoidance")]
+        [SerializeField] private ObstacleAvoidanceType obstacleAvoidanceQuality = ObstacleAvoidanceType.HighQualityObstacleAvoidance;
+
         public RobotStatus Status { get; private set; } = RobotStatus.Idle;
+        public int AssignedNodeId { get; private set; } = -1;
+        public NavMeshAgent Agent => agent;
 
         private NavMeshAgent agent;
         private Camera cachedMainCamera;
         private float currentSpeed;
         private float autoMoveTimer;
         private float statusTimer;
+        private bool shouldPerformPickOnArrival;
+        private float yieldingTimer;
 
         private void Awake()
         {
@@ -75,6 +83,7 @@ namespace WarehouseSimulation.Robots
             agent.autoBraking = true;
             agent.stoppingDistance = stopDistance;
             agent.acceleration = acceleration;
+            agent.obstacleAvoidanceType = obstacleAvoidanceQuality;
 
             // Turning radius approximation:
             // angular speed (deg/s) = linear speed (m/s) / radius (m) converted to degrees.
@@ -82,6 +91,58 @@ namespace WarehouseSimulation.Robots
 
             currentSpeed = 0f;
             agent.speed = 0f;
+        }
+
+        public void SetClickToMoveEnabled(bool enabled)
+        {
+            clickToMove = enabled;
+        }
+
+        public void SetAutoMoveEnabled(bool enabled)
+        {
+            autoMoveToRandomPoint = enabled;
+        }
+
+        public void SetAvoidancePriority(int priority)
+        {
+            if (agent != null)
+            {
+                agent.avoidancePriority = Mathf.Clamp(priority, 0, 99);
+            }
+        }
+
+        public bool AssignRoamingDestination(Vector3 worldPosition, int nodeId)
+        {
+            if (!agent.isOnNavMesh)
+            {
+                return false;
+            }
+
+            shouldPerformPickOnArrival = false;
+            AssignedNodeId = nodeId;
+
+            if (agent.SetDestination(worldPosition))
+            {
+                statusTimer = 0f;
+                yieldingTimer = 0f;
+                SetStatus(RobotStatus.Moving);
+                return true;
+            }
+
+            return false;
+        }
+
+        public void StartYield(float seconds)
+        {
+            if (seconds <= 0f)
+            {
+                return;
+            }
+
+            yieldingTimer = seconds;
+            AssignedNodeId = -1;
+            agent.ResetPath();
+            SetStatus(RobotStatus.Yielding);
         }
 
         private void HandleDestinationInput()
@@ -141,6 +202,9 @@ namespace WarehouseSimulation.Robots
                 return;
             }
 
+            shouldPerformPickOnArrival = true;
+            AssignedNodeId = -1;
+
             if (agent.SetDestination(worldPosition))
             {
                 statusTimer = 0f;
@@ -150,6 +214,17 @@ namespace WarehouseSimulation.Robots
 
         private void UpdateStatusStateMachine()
         {
+            if (Status == RobotStatus.Yielding)
+            {
+                yieldingTimer -= Time.deltaTime;
+                if (yieldingTimer <= 0f)
+                {
+                    SetStatus(RobotStatus.Idle);
+                }
+
+                return;
+            }
+
             if (Status == RobotStatus.Moving || Status == RobotStatus.Delivering)
             {
                 if (HasArrivedAtDestination())
@@ -157,8 +232,17 @@ namespace WarehouseSimulation.Robots
                     if (Status == RobotStatus.Moving)
                     {
                         agent.ResetPath();
-                        statusTimer = pickDuration;
-                        SetStatus(RobotStatus.Picking);
+
+                        if (shouldPerformPickOnArrival)
+                        {
+                            statusTimer = pickDuration;
+                            SetStatus(RobotStatus.Picking);
+                        }
+                        else
+                        {
+                            AssignedNodeId = -1;
+                            SetStatus(RobotStatus.Idle);
+                        }
                     }
                     else
                     {
