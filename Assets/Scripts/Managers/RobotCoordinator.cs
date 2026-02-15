@@ -26,6 +26,7 @@ namespace WarehouseSimulation.Managers
 
         [Header("Debug")]
         [SerializeField] private bool logRobotStates;
+        [SerializeField] private bool enableRandomMovement = true;
 
         private readonly List<RobotAgent> robots = new();
         private readonly List<Vector3> navigationNodes = new();
@@ -34,6 +35,13 @@ namespace WarehouseSimulation.Managers
 
         private float assignmentTimer;
         private float monitorTimer;
+
+        public IReadOnlyList<RobotAgent> ActiveRobots => robots;
+
+        public void SetRandomMovementEnabled(bool enabled)
+        {
+            enableRandomMovement = enabled;
+        }
 
         private void Awake()
         {
@@ -44,11 +52,14 @@ namespace WarehouseSimulation.Managers
 
         private void FixedUpdate()
         {
-            assignmentTimer += Time.fixedDeltaTime;
-            if (assignmentTimer >= assignmentInterval)
+            if (enableRandomMovement)
             {
-                assignmentTimer = 0f;
-                AssignRandomMovementTasks();
+                assignmentTimer += Time.fixedDeltaTime;
+                if (assignmentTimer >= assignmentInterval)
+                {
+                    assignmentTimer = 0f;
+                    AssignRandomMovementTasks();
+                }
             }
 
             MonitorRobotStates();

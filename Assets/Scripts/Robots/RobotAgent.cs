@@ -1,12 +1,13 @@
+using System;
 using UnityEngine;
 using UnityEngine.AI;
+using WarehouseSimulation.Tasks;
 
 namespace WarehouseSimulation.Robots
 {
     /// <summary>
     /// Controls a single autonomous warehouse robot using Unity's NavMesh.
-    /// Handles movement constraints, simple pick/deliver flow, test destination input,
-    /// and basic collision/obstacle detection against shelves and walls.
+    /// Handles movement constraints, pick/deliver flow, and optional manual/random roaming.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class RobotAgent : MonoBehaviour
@@ -50,6 +51,7 @@ namespace WarehouseSimulation.Robots
         public RobotStatus Status { get; private set; } = RobotStatus.Idle;
         public int AssignedNodeId { get; private set; } = -1;
         public NavMeshAgent Agent => agent;
+        public bool IsBusy => activeWarehouseTask != null || Status == RobotStatus.Picking || Status == RobotStatus.Delivering || Status == RobotStatus.Moving;
 
         private NavMeshAgent agent;
         private Camera cachedMainCamera;
@@ -58,6 +60,10 @@ namespace WarehouseSimulation.Robots
         private float statusTimer;
         private bool shouldPerformPickOnArrival;
         private float yieldingTimer;
+
+        private IWarehouseTask activeWarehouseTask;
+        private Action<RobotAgent, IWarehouseTask> taskCompletedCallback;
+        private Transform activeDeliveryZone;
 
         private void Awake()
         {
@@ -85,23 +91,15 @@ namespace WarehouseSimulation.Robots
             agent.acceleration = acceleration;
             agent.obstacleAvoidanceType = obstacleAvoidanceQuality;
 
-            // Turning radius approximation:
-            // angular speed (deg/s) = linear speed (m/s) / radius (m) converted to degrees.
             agent.angularSpeed = Mathf.Rad2Deg * (maxSpeed / turningRadius);
 
             currentSpeed = 0f;
             agent.speed = 0f;
         }
 
-        public void SetClickToMoveEnabled(bool enabled)
-        {
-            clickToMove = enabled;
-        }
+        public void SetClickToMoveEnabled(bool enabled) => clickToMove = enabled;
 
-        public void SetAutoMoveEnabled(bool enabled)
-        {
-            autoMoveToRandomPoint = enabled;
-        }
+        public void SetAutoMoveEnabled(bool enabled) => autoMoveToRandomPoint = enabled;
 
         public void SetAvoidancePriority(int priority)
         {
@@ -132,6 +130,48 @@ namespace WarehouseSimulation.Robots
             return false;
         }
 
+        /// <summary>
+        /// Assigns a warehouse task (order/restock) to this robot.
+        /// Robot path: shelf -> timed pick action -> delivery zone -> completion callback.
+        /// </summary>
+        public bool AssignWarehouseTask(
+            IWarehouseTask task,
+            Transform deliveryZone,
+            float pickSeconds,
+            Action<RobotAgent, IWarehouseTask> onTaskCompleted)
+        {
+            if (task == null || task.TargetShelf == null || !agent.isOnNavMesh || Status == RobotStatus.Yielding)
+            {
+                return false;
+            }
+
+            if (activeWarehouseTask != null)
+            {
+                return false;
+            }
+
+            activeWarehouseTask = task;
+            activeDeliveryZone = deliveryZone != null ? deliveryZone : deliveryPoint;
+            taskCompletedCallback = onTaskCompleted;
+            pickDuration = Mathf.Max(0.1f, pickSeconds);
+
+            shouldPerformPickOnArrival = true;
+            AssignedNodeId = -1;
+
+            bool hasPath = agent.SetDestination(task.TargetShelf.transform.position);
+            if (!hasPath)
+            {
+                activeWarehouseTask = null;
+                activeDeliveryZone = null;
+                taskCompletedCallback = null;
+                return false;
+            }
+
+            statusTimer = 0f;
+            SetStatus(RobotStatus.Moving);
+            return true;
+        }
+
         public void StartYield(float seconds)
         {
             if (seconds <= 0f)
@@ -147,7 +187,7 @@ namespace WarehouseSimulation.Robots
 
         private void HandleDestinationInput()
         {
-            if (!clickToMove || !Input.GetMouseButtonDown(0))
+            if (!clickToMove || !Input.GetMouseButtonDown(0) || activeWarehouseTask != null)
             {
                 return;
             }
@@ -172,7 +212,7 @@ namespace WarehouseSimulation.Robots
 
         private void HandleAutoMove()
         {
-            if (!autoMoveToRandomPoint || Status == RobotStatus.Picking)
+            if (!autoMoveToRandomPoint || Status == RobotStatus.Picking || activeWarehouseTask != null)
             {
                 return;
             }
@@ -247,6 +287,7 @@ namespace WarehouseSimulation.Robots
                     else
                     {
                         agent.ResetPath();
+                        CompleteActiveTaskIfAny();
                         SetStatus(RobotStatus.Idle);
                     }
                 }
@@ -262,16 +303,40 @@ namespace WarehouseSimulation.Robots
                     return;
                 }
 
-                if (deliveryPoint != null && agent.isOnNavMesh)
+                Transform destination = activeDeliveryZone != null ? activeDeliveryZone : deliveryPoint;
+                if (destination != null && agent.isOnNavMesh)
                 {
-                    bool hasPath = agent.SetDestination(deliveryPoint.position);
+                    bool hasPath = agent.SetDestination(destination.position);
                     SetStatus(hasPath ? RobotStatus.Delivering : RobotStatus.Idle);
+
+                    if (!hasPath)
+                    {
+                        CompleteActiveTaskIfAny();
+                    }
                 }
                 else
                 {
+                    CompleteActiveTaskIfAny();
                     SetStatus(RobotStatus.Idle);
                 }
             }
+        }
+
+        private void CompleteActiveTaskIfAny()
+        {
+            if (activeWarehouseTask == null)
+            {
+                return;
+            }
+
+            IWarehouseTask completedTask = activeWarehouseTask;
+            activeWarehouseTask = null;
+
+            Action<RobotAgent, IWarehouseTask> callback = taskCompletedCallback;
+            taskCompletedCallback = null;
+            activeDeliveryZone = null;
+
+            callback?.Invoke(this, completedTask);
         }
 
         private bool HasArrivedAtDestination()
@@ -295,8 +360,6 @@ namespace WarehouseSimulation.Robots
             if (Status == RobotStatus.Moving || Status == RobotStatus.Delivering)
             {
                 float distance = Mathf.Max(agent.remainingDistance - agent.stoppingDistance, 0f);
-
-                // Speed needed to brake smoothly to stop within remaining distance.
                 float decelLimitedSpeed = Mathf.Sqrt(2f * deceleration * Mathf.Max(distance, 0f));
                 targetSpeed = Mathf.Min(maxSpeed, decelLimitedSpeed);
             }
@@ -335,15 +398,11 @@ namespace WarehouseSimulation.Robots
         {
             if (IsObstacleCollision(collision.gameObject.layer))
             {
-                // While touching walls/shelves, force a near stop to avoid jitter pushing.
                 agent.speed = Mathf.Min(agent.speed, 0.2f);
             }
         }
 
-        private bool IsObstacleCollision(int otherLayer)
-        {
-            return (obstacleLayers.value & (1 << otherLayer)) != 0;
-        }
+        private bool IsObstacleCollision(int otherLayer) => (obstacleLayers.value & (1 << otherLayer)) != 0;
 
         private void SetStatus(RobotStatus newStatus)
         {
