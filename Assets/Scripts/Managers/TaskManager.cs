@@ -18,6 +18,7 @@ namespace WarehouseSimulation.Managers
         [Header("References")]
         [SerializeField] private RobotCoordinator robotCoordinator;
         [SerializeField] private Transform deliveryZone;
+        [SerializeField] private LearningMetrics learningMetrics;
 
         [Header("Order Generation")]
         [SerializeField] private bool autoGenerateOrders = true;
@@ -44,7 +45,14 @@ namespace WarehouseSimulation.Managers
         private readonly List<Order> orderQueue = new();
         private readonly List<RestockTask> restockQueue = new();
         private readonly HashSet<Shelf> restockShelvesPending = new();
-        private readonly Dictionary<RobotAgent, IWarehouseTask> activeAssignments = new();
+        private sealed class AssignmentTelemetry
+        {
+            public float StartedAt;
+            public float DistanceAtAssignment;
+            public float OptimalDistance;
+        }
+
+        private readonly Dictionary<RobotAgent, AssignmentTelemetry> activeAssignments = new();
 
         private float orderTimer;
         private int deliveryStreak;
@@ -65,12 +73,22 @@ namespace WarehouseSimulation.Managers
             {
                 robotCoordinator.SetRandomMovementEnabled(!disableRandomRoaming);
             }
+
+            if (learningMetrics == null)
+            {
+                learningMetrics = FindObjectOfType<LearningMetrics>();
+            }
         }
 
         private void Update()
         {
             TryGenerateRandomOrder();
             AssignTasksToAvailableRobots();
+
+            if (learningMetrics != null && robotCoordinator != null)
+            {
+                learningMetrics.Tick(Time.deltaTime, robotCoordinator.ActiveRobots);
+            }
         }
 
         private void OnDestroy()
@@ -254,7 +272,7 @@ namespace WarehouseSimulation.Managers
                     continue;
                 }
 
-                activeAssignments[robot] = nextTask;
+                activeAssignments[robot] = BuildAssignmentTelemetry(robot, nextTask);
                 if (nextTask.IsRestockTask)
                 {
                     deliveryStreak = 0;
@@ -361,9 +379,18 @@ namespace WarehouseSimulation.Managers
 
         private void OnRobotTaskCompleted(RobotAgent robot, IWarehouseTask completedTask)
         {
+            AssignmentTelemetry telemetry = null;
             if (robot != null)
             {
+                activeAssignments.TryGetValue(robot, out telemetry);
                 activeAssignments.Remove(robot);
+            }
+
+            if (learningMetrics != null && robot != null && telemetry != null)
+            {
+                float completionTime = Mathf.Max(0f, Time.time - telemetry.StartedAt);
+                float actualDistance = Mathf.Max(0f, robot.EpisodeDistanceTraveled - telemetry.DistanceAtAssignment);
+                learningMetrics.RecordTaskCompletion(completionTime, actualDistance, telemetry.OptimalDistance);
             }
 
             if (completedTask?.TargetShelf == null)
@@ -394,6 +421,24 @@ namespace WarehouseSimulation.Managers
             {
                 EnqueueRestockTask(completedTask.TargetShelf);
             }
+        }
+
+
+        private AssignmentTelemetry BuildAssignmentTelemetry(RobotAgent robot, IWarehouseTask task)
+        {
+            float startDistance = robot != null ? robot.EpisodeDistanceTraveled : 0f;
+            Vector3 robotPosition = robot != null ? robot.transform.position : Vector3.zero;
+            Vector3 shelfPosition = task?.TargetShelf != null ? task.TargetShelf.transform.position : robotPosition;
+            Vector3 dropPosition = deliveryZone != null ? deliveryZone.position : shelfPosition;
+
+            float optimalDistance = Vector3.Distance(robotPosition, shelfPosition) + Vector3.Distance(shelfPosition, dropPosition);
+
+            return new AssignmentTelemetry
+            {
+                StartedAt = Time.time,
+                DistanceAtAssignment = startDistance,
+                OptimalDistance = Mathf.Max(0.0001f, optimalDistance)
+            };
         }
 
         private string BuildTaskId(string prefix)

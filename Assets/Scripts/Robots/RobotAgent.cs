@@ -70,6 +70,8 @@ namespace WarehouseSimulation.Robots
         public int AssignedNodeId { get; private set; } = -1;
         public NavMeshAgent Agent => agent;
         public bool IsBusy => activeWarehouseTask != null || Status == RobotStatus.Picking || Status == RobotStatus.Delivering || Status == RobotStatus.Moving;
+        public float EpisodeDistanceTraveled { get; private set; }
+        public int EpisodeCollisionCount { get; private set; }
 
         private NavMeshAgent agent;
         private Camera cachedMainCamera;
@@ -79,6 +81,7 @@ namespace WarehouseSimulation.Robots
         private bool shouldPerformPickOnArrival;
         private float yieldingTimer;
         private float taskStartTime;
+        private Vector3 previousPosition;
 
         private readonly List<RobotAgent> nearbyRobotBuffer = new();
 
@@ -93,6 +96,7 @@ namespace WarehouseSimulation.Robots
 
             ConfigureNavAgent();
             SetStatus(RobotStatus.Idle);
+            previousPosition = transform.position;
         }
 
         private void Update()
@@ -102,6 +106,7 @@ namespace WarehouseSimulation.Robots
             UpdateStatusStateMachine();
             UpdateConstrainedSpeed();
             ProbeForwardForObstacle();
+            AccumulateDistanceTraveled();
 
             if (useLearningDecisions && Status == RobotStatus.Idle)
             {
@@ -119,6 +124,9 @@ namespace WarehouseSimulation.Robots
             activeWarehouseTask = null;
             activeDeliveryZone = null;
             taskCompletedCallback = null;
+            EpisodeDistanceTraveled = 0f;
+            EpisodeCollisionCount = 0;
+            previousPosition = transform.position;
 
             if (agent != null && agent.isOnNavMesh)
             {
@@ -508,6 +516,8 @@ namespace WarehouseSimulation.Robots
 
         private void OnCollisionEnter(Collision collision)
         {
+            EpisodeCollisionCount++;
+
             if (!useLearningDecisions)
             {
                 if (IsObstacleCollision(collision.gameObject.layer))
@@ -529,6 +539,19 @@ namespace WarehouseSimulation.Robots
                 AddReward(-obstacleCollisionPenalty);
                 Debug.Log($"[{name}] Collided with obstacle: {collision.gameObject.name}");
             }
+        }
+
+        private void AccumulateDistanceTraveled()
+        {
+            Vector3 currentPosition = transform.position;
+            float delta = Vector3.Distance(previousPosition, currentPosition);
+
+            if (delta > 0.0001f)
+            {
+                EpisodeDistanceTraveled += delta;
+            }
+
+            previousPosition = currentPosition;
         }
 
         private void OnCollisionStay(Collision collision)
