@@ -57,14 +57,16 @@ namespace WarehouseSimulation.Robots
         [SerializeField] private bool useLearningDecisions;
         [SerializeField, Min(0.1f)] private float decisionTargetRadius = 6f;
         [SerializeField, Min(0.1f)] private float decisionStepDistance = 2.5f;
-        [SerializeField, Min(0f)] private float idlePenaltyPerSecond = 0.0015f;
+        [SerializeField, Min(0f)] private float timePenaltyPerStep = 0.01f;
+        [SerializeField, Min(0f)] private float movementTowardTargetRewardPerUnit = 0.1f;
+        [SerializeField, Min(0f)] private float taskCompletionReward = 10f;
+        [SerializeField, Min(0f)] private float collisionPenalty = 5f;
+        [SerializeField, Min(0f)] private float idlePenalty = 0.5f;
+        [SerializeField, Min(0.1f)] private float idleTimeoutSeconds = 3f;
         [SerializeField] private LayerMask robotDetectionLayers;
         [SerializeField, Min(0.5f)] private float nearbyRobotDetectionRadius = 5f;
         [SerializeField, Range(1, 8)] private int maxNearbyRobotObservations = 3;
-        [SerializeField, Min(0f)] private float collisionPenalty = 0.3f;
-        [SerializeField, Min(0f)] private float obstacleCollisionPenalty = 0.15f;
-        [SerializeField, Min(0f)] private float taskCompletionReward = 1.2f;
-        [SerializeField, Min(0.1f)] private float fastCompletionReferenceSeconds = 20f;
+        [SerializeField, Min(0.05f)] private float idleSpeedThreshold = 0.15f;
 
         [Header("Debug / Visualization")]
         [SerializeField] private bool debugLogging;
@@ -87,6 +89,10 @@ namespace WarehouseSimulation.Robots
         private float yieldingTimer;
         private float taskStartTime;
         private Vector3 previousPosition;
+        private Vector3 initialPosition;
+        private Quaternion initialRotation;
+        private float previousDistanceToTarget;
+        private float idleTime;
 
         private readonly List<RobotAgent> nearbyRobotBuffer = new();
         private Collider[] nearbyRobotColliders;
@@ -110,7 +116,10 @@ namespace WarehouseSimulation.Robots
 
             ConfigureNavAgent();
             SetStatus(RobotStatus.Idle);
+            initialPosition = transform.position;
+            initialRotation = transform.rotation;
             previousPosition = transform.position;
+            previousDistanceToTarget = 0f;
         }
 
         private void Update()
@@ -122,10 +131,6 @@ namespace WarehouseSimulation.Robots
             ProbeForwardForObstacle();
             AccumulateDistanceTraveled();
 
-            if (useLearningDecisions && Status == RobotStatus.Idle)
-            {
-                AddReward(-idlePenaltyPerSecond * Time.deltaTime);
-            }
         }
 
         public override void OnEpisodeBegin()
@@ -140,7 +145,12 @@ namespace WarehouseSimulation.Robots
             taskCompletedCallback = null;
             EpisodeDistanceTraveled = 0f;
             EpisodeCollisionCount = 0;
+
+            transform.position = initialPosition;
+            transform.rotation = initialRotation;
             previousPosition = transform.position;
+            previousDistanceToTarget = Vector3.Distance(transform.position, GetCurrentLearningTarget());
+            idleTime = 0f;
 
             if (agent != null && agent.isOnNavMesh)
             {
@@ -156,34 +166,24 @@ namespace WarehouseSimulation.Robots
             Vector3 toTarget = target - transform.position;
             float distanceToTarget = toTarget.magnitude;
 
+            sensor.AddObservation(Mathf.Clamp(transform.position.x / decisionTargetRadius, -1f, 1f));
+            sensor.AddObservation(Mathf.Clamp(transform.position.z / decisionTargetRadius, -1f, 1f));
+            sensor.AddObservation(Mathf.Clamp(target.x / decisionTargetRadius, -1f, 1f));
+            sensor.AddObservation(Mathf.Clamp(target.z / decisionTargetRadius, -1f, 1f));
             sensor.AddObservation(Mathf.Clamp01(distanceToTarget / Mathf.Max(decisionTargetRadius, 0.1f)));
+            sensor.AddObservation(Mathf.Clamp01(agent.velocity.magnitude / Mathf.Max(maxSpeed, 0.1f)));
 
-            Vector3 localTargetDirection = transform.InverseTransformDirection(toTarget.normalized);
-            sensor.AddObservation(localTargetDirection.x);
-            sensor.AddObservation(localTargetDirection.z);
+            AddObstacleDistanceObservations(sensor);
 
-            PopulateNearbyRobots();
-            for (int i = 0; i < maxNearbyRobotObservations; i++)
-            {
-                if (i >= nearbyRobotBuffer.Count)
-                {
-                    sensor.AddObservation(0f);
-                    sensor.AddObservation(0f);
-                    sensor.AddObservation(0f);
-                    continue;
-                }
-
-                Vector3 offset = nearbyRobotBuffer[i].transform.position - transform.position;
-                Vector3 localOffset = transform.InverseTransformDirection(offset.normalized);
-                sensor.AddObservation(localOffset.x);
-                sensor.AddObservation(localOffset.z);
-                sensor.AddObservation(Mathf.Clamp01(offset.magnitude / nearbyRobotDetectionRadius));
-            }
-
-            // Current task type encoded as one-hot: [Idle, Order, Restock].
+            // Task type encoded as one-hot: [Idle, Order, Restock].
             sensor.AddObservation(activeWarehouseTask == null ? 1f : 0f);
             sensor.AddObservation(activeWarehouseTask != null && !activeWarehouseTask.IsRestockTask ? 1f : 0f);
             sensor.AddObservation(activeWarehouseTask != null && activeWarehouseTask.IsRestockTask ? 1f : 0f);
+
+            sensor.AddObservation(activeWarehouseTask == null ? 0f : 1f);
+
+            PopulateNearbyRobots();
+            sensor.AddObservation(Mathf.Clamp01((float)nearbyRobotBuffer.Count / Mathf.Max(1f, maxNearbyRobotObservations)));
         }
 
         public override void OnActionReceived(ActionBuffers actions)
@@ -205,6 +205,7 @@ namespace WarehouseSimulation.Robots
             float speedScale = Mathf.Clamp01((continuous[2] + 1f) * 0.5f);
 
             ApplyLearningMovement(moveDirection, speedScale);
+            ApplyLearningRewards(moveDirection);
         }
 
         public override void Heuristic(in ActionBuffers actionsOut)
@@ -472,9 +473,7 @@ namespace WarehouseSimulation.Robots
 
             if (useLearningDecisions)
             {
-                float completionTime = taskStartTime > 0f ? Time.time - taskStartTime : fastCompletionReferenceSeconds;
-                float speedMultiplier = Mathf.Clamp01(fastCompletionReferenceSeconds / Mathf.Max(0.1f, completionTime));
-                AddReward(taskCompletionReward * speedMultiplier);
+                AddReward(taskCompletionReward);
             }
 
             taskStartTime = 0f;
@@ -555,7 +554,7 @@ namespace WarehouseSimulation.Robots
 
             if (IsObstacleCollision(collision.gameObject.layer))
             {
-                AddReward(-obstacleCollisionPenalty);
+                AddReward(-collisionPenalty);
                 LogDebug($"Collided with obstacle: {collision.gameObject.name}");
             }
         }
@@ -627,6 +626,60 @@ namespace WarehouseSimulation.Robots
             nearbyRobotBuffer.Sort((lhs, rhs) =>
                 Vector3.SqrMagnitude(lhs.transform.position - transform.position)
                     .CompareTo(Vector3.SqrMagnitude(rhs.transform.position - transform.position)));
+        }
+
+        private void AddObstacleDistanceObservations(VectorSensor sensor)
+        {
+            Vector3 origin = transform.position + Vector3.up * 0.3f;
+            AddDirectionalObstacleDistance(sensor, origin, transform.forward);
+            AddDirectionalObstacleDistance(sensor, origin, -transform.forward);
+            AddDirectionalObstacleDistance(sensor, origin, -transform.right);
+            AddDirectionalObstacleDistance(sensor, origin, transform.right);
+        }
+
+        private void AddDirectionalObstacleDistance(VectorSensor sensor, Vector3 origin, Vector3 direction)
+        {
+            bool hit = Physics.SphereCast(
+                origin,
+                obstacleProbeRadius,
+                direction,
+                out RaycastHit hitInfo,
+                obstacleProbeDistance,
+                obstacleLayers,
+                QueryTriggerInteraction.Ignore);
+
+            float normalizedDistance = hit
+                ? Mathf.Clamp01(hitInfo.distance / Mathf.Max(0.1f, obstacleProbeDistance))
+                : 1f;
+            sensor.AddObservation(normalizedDistance);
+        }
+
+        private void ApplyLearningRewards(Vector2 moveDirection)
+        {
+            float currentDistance = Vector3.Distance(transform.position, GetCurrentLearningTarget());
+            float towardTargetDelta = previousDistanceToTarget - currentDistance;
+            if (towardTargetDelta > 0f)
+            {
+                AddReward(towardTargetDelta * movementTowardTargetRewardPerUnit);
+            }
+
+            AddReward(-timePenaltyPerStep);
+
+            if (moveDirection.sqrMagnitude < 0.01f || agent.velocity.magnitude < idleSpeedThreshold)
+            {
+                idleTime += Time.deltaTime;
+                if (idleTime >= idleTimeoutSeconds)
+                {
+                    AddReward(-idlePenalty);
+                    idleTime = 0f;
+                }
+            }
+            else
+            {
+                idleTime = 0f;
+            }
+
+            previousDistanceToTarget = currentDistance;
         }
 
         private void ApplyLearningMovement(Vector2 moveDirection, float speedScale)

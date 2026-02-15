@@ -18,14 +18,20 @@ namespace WarehouseSimulation.UI
         [SerializeField] private UnityEvent onStopSimulation;
         [SerializeField] private UnityEvent onResetSimulation;
         [SerializeField] private UnityEvent onSpawnRobot;
+        [SerializeField] private UnityEvent onStartTraining;
+        [SerializeField] private UnityEvent onStopTraining;
+        [SerializeField] private UnityEvent onResetTrainingEnvironment;
         [SerializeField] private UnityEvent<float> onTimeScaleChanged;
         [SerializeField] private UnityEvent<float> onOrderRateChanged;
+        [SerializeField] private UnityEvent<float> onTrainingSpeedMultiplierChanged;
 
         [Header("Control Defaults")]
         [SerializeField] private Vector2 timeScaleRange = new Vector2(0.2f, 4f);
         [SerializeField] private float defaultTimeScale = 1f;
         [SerializeField] private Vector2 orderRateRange = new Vector2(1f, 30f);
         [SerializeField] private float defaultOrderRate = 8f;
+        [SerializeField] private Vector2 trainingSpeedRange = new Vector2(0.2f, 10f);
+        [SerializeField] private float defaultTrainingSpeed = 1f;
 
         private TextMeshProUGUI ordersCompletedValue;
         private TextMeshProUGUI averageDeliveryValue;
@@ -36,6 +42,7 @@ namespace WarehouseSimulation.UI
         private Slider learningProgressSlider;
         private TextMeshProUGUI timeScaleLabel;
         private TextMeshProUGUI orderRateLabel;
+        private TextMeshProUGUI trainingSpeedLabel;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void BootstrapDashboard()
@@ -169,6 +176,9 @@ namespace WarehouseSimulation.UI
             CreateButton(buttonGrid.transform, "Stop simulation", () => onStopSimulation?.Invoke());
             CreateButton(buttonGrid.transform, "Reset simulation", () => onResetSimulation?.Invoke());
             CreateButton(buttonGrid.transform, "Spawn new robot", () => onSpawnRobot?.Invoke());
+            CreateButton(buttonGrid.transform, "Start training", () => onStartTraining?.Invoke());
+            CreateButton(buttonGrid.transform, "Stop training", () => onStopTraining?.Invoke());
+            CreateButton(buttonGrid.transform, "Reset environment", () => onResetTrainingEnvironment?.Invoke());
 
             timeScaleLabel = CreateLabeledSlider(
                 controlsContainer.transform,
@@ -193,6 +203,18 @@ namespace WarehouseSimulation.UI
                 {
                     orderRateLabel.text = $"{value:0.0} orders/min";
                     onOrderRateChanged?.Invoke(value);
+                });
+
+            trainingSpeedLabel = CreateLabeledSlider(
+                controlsContainer.transform,
+                "Training speed multiplier",
+                trainingSpeedRange.x,
+                trainingSpeedRange.y,
+                defaultTrainingSpeed,
+                value =>
+                {
+                    trainingSpeedLabel.text = $"{value:0.00}x";
+                    onTrainingSpeedMultiplierChanged?.Invoke(value);
                 });
         }
 
